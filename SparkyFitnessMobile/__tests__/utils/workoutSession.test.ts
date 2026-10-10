@@ -33,6 +33,7 @@ import {
   describeActiveSetAssumed,
   evaluateExerciseProgression,
   resolveAssumedSetValues,
+  alignPreviousSets,
   resolveLiveAssumedSetValues,
   extractPlannedSetValues,
   stripPlannedSetValues,
@@ -62,6 +63,10 @@ import {
   formatDurationSeconds,
   buildActivitySetsPayload,
   firstSetInputField,
+  formatSetWeightText,
+  hasBodyweightExercise,
+  isPrSet,
+  setLoadKg,
 } from '../../src/utils/workoutSession';
 import { wodScoreFormat } from '../../src/utils/wodScore';
 import type {
@@ -1216,6 +1221,23 @@ describe('workoutSession', () => {
       ...overrides,
     });
 
+    it('keeps a signed weight only for a bodyweight exercise', () => {
+      const signed = makeDraftExercise({
+        exerciseModality: 'bodyweight_reps',
+        sets: [{ clientId: 's1', weight: '-10', reps: '8' }],
+      });
+      const plain = makeDraftExercise({
+        exerciseModality: 'weight_reps',
+        sets: [{ clientId: 's1', weight: '-10', reps: '8' }],
+      });
+      expect(
+        buildExercisesPayload([signed], 'kg', 'km')[0].sets[0].weight
+      ).toBe(-10);
+      expect(buildExercisesPayload([plain], 'kg', 'km')[0].sets[0].weight).toBe(
+        null
+      );
+    });
+
     it('maps exercises with sort_order from array index', () => {
       const exercises = [
         makeDraftExercise({ exerciseId: 'ex-1' }),
@@ -1972,6 +1994,7 @@ describe('workoutSession', () => {
           name: 'Bench Press',
           category: 'Strength',
           modality: null,
+          equipment: null,
           images: ['bench.png'],
         });
         expect(card.sets[0]).toMatchObject({
@@ -2323,7 +2346,7 @@ describe('workoutSession', () => {
       const startedAt = Date.UTC(2026, 2, 20, 10, 0, 0);
       const min = (n: number) => startedAt + n * 60_000;
 
-      it('splits start→last-completion across exercises by completed-set count', () => {
+      it('gives each exercise the time up to its own completed sets', () => {
         const session = makePreset({
           exercises: [
             makeExercise({
@@ -2345,8 +2368,83 @@ describe('workoutSession', () => {
           {},
           startedAt
         );
-        expect(payload[0].duration_minutes).toBe(20); // 30 × 2/3
-        expect(payload[1].duration_minutes).toBe(10); // 30 × 1/3
+        expect(payload[0].duration_minutes).toBe(12); // start → 12 min
+        expect(payload[1].duration_minutes).toBe(18); // 12 → 30 min
+      });
+
+      it('splits alternating superset sets by their own gaps', () => {
+        const session = makePreset({
+          exercises: [
+            makeExercise({
+              superset_group: 1,
+              sets: [makeSet({ id: 101 }), makeSet({ id: 102, set_number: 2 })],
+            }),
+            makeExercise({
+              id: ENTRY_B,
+              exercise_id: EX_2,
+              superset_group: 1,
+              sets: [makeSet({ id: 201 }), makeSet({ id: 202, set_number: 2 })],
+            }),
+          ],
+        });
+
+        const completed = {
+          '101': min(3),
+          '201': min(5),
+          '102': min(8),
+          '202': min(11),
+        };
+        const payload = buildSessionExercisesPayload(
+          session,
+          completed,
+          {},
+          startedAt
+        );
+        expect(payload[0].duration_minutes).toBe(6); // 0→3 + 5→8
+        expect(payload[1].duration_minutes).toBe(5); // 3→5 + 8→11
+      });
+
+      it('stamps entry_time with the local start of each exercise', () => {
+        const localStart = new Date(2026, 2, 20, 10, 0, 0).getTime();
+        const at = (n: number) => localStart + n * 60_000;
+        const session = makePreset({
+          exercises: [
+            makeExercise({
+              sets: [makeSet({ id: 101 }), makeSet({ id: 102, set_number: 2 })],
+            }),
+            makeExercise({
+              id: ENTRY_B,
+              exercise_id: EX_2,
+              sets: [makeSet({ id: 201 })],
+            }),
+            makeExercise({
+              id: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+              sets: [makeSet({ id: 301 })],
+            }),
+          ],
+        });
+        const payload = buildSessionExercisesPayload(
+          session,
+          { '101': at(4), '102': at(12), '201': at(19) },
+          {},
+          localStart
+        );
+        expect(payload[0].entry_time).toBe('10:00');
+        expect(payload[1].entry_time).toBe('10:12');
+        // Nothing completed yet: omitted so the server keeps its value.
+        expect('entry_time' in payload[2]).toBe(false);
+      });
+
+      it('omits entry_time without a workout start', () => {
+        const session = makePreset({
+          exercises: [makeExercise({ sets: [makeSet({ id: 101 })] })],
+        });
+        const payload = buildSessionExercisesPayload(
+          session,
+          { '101': min(10) },
+          {}
+        );
+        expect('entry_time' in payload[0]).toBe(false);
       });
 
       it('gives an exercise with no completed sets zero duration', () => {
@@ -3435,6 +3533,116 @@ describe('workoutSession', () => {
       });
     });
 
+    describe('bodyweight exercises', () => {
+      const bodyweightSet = (id: number, weight: number | null, reps = 8) => ({
+        id,
+        set_number: id,
+        set_type: 'normal',
+        reps,
+        weight,
+        duration: null,
+        rest_time: null,
+        notes: null,
+        rpe: null,
+      });
+      const dips = (sets: ReturnType<typeof bodyweightSet>[]) => ({
+        id: 'dips',
+        exercise_id: 'x-dips',
+        exercise_snapshot: { name: 'Dips', modality: 'bodyweight_reps' },
+        sets,
+      });
+
+      it('counts body weight plus added or assisting weight in volume', () => {
+        // 80 kg lifter: +20 kg moves 100 kg, −30 kg of assistance moves 50.
+        expect(setVolumeKg(bodyweightSet(1, 20), 'bodyweight_reps', 80)).toBe(
+          800
+        );
+        expect(setVolumeKg(bodyweightSet(1, -30), 'bodyweight_reps', 80)).toBe(
+          400
+        );
+        expect(
+          getExerciseVolumeKg(
+            dips([bodyweightSet(1, null, 10), bodyweightSet(2, 20)]),
+            80
+          )
+        ).toBe(80 * 10 + 100 * 8);
+      });
+
+      it('counts only the added weight while body weight is unknown', () => {
+        expect(
+          getExerciseVolumeKg(
+            dips([bodyweightSet(1, 20), bodyweightSet(2, -30)]),
+            null
+          )
+        ).toBe(20 * 8);
+      });
+
+      it('takes the load, not the belt weight, for estimated maxes', () => {
+        expect(setLoadKg(20, 'bodyweight_reps', 80)).toBe(100);
+        expect(setLoadKg(20, 'weight_reps', 80)).toBe(20);
+        expect(setLoadKg(null, 'weight_reps', 80)).toBeNull();
+      });
+
+      it('shows the sign on a bodyweight set weight only', () => {
+        expect(formatSetWeightText('20', 20, 'bodyweight_reps')).toBe('+20');
+        expect(formatSetWeightText('-30', -30, 'bodyweight_reps')).toBe(
+          '\u221230'
+        );
+        expect(formatSetWeightText('20', 20, 'weight_reps')).toBe('20');
+      });
+
+      it('focuses reps first, since the weight is optional', () => {
+        expect(firstSetInputField('bodyweight_reps')).toBe('reps');
+      });
+
+      it('spots a bodyweight exercise in a list', () => {
+        expect(hasBodyweightExercise([dips([])])).toBe(true);
+        expect(
+          hasBodyweightExercise([
+            { exercise_snapshot: { modality: 'weight_reps' } },
+          ])
+        ).toBe(false);
+      });
+
+      it('ranks an unweighted bodyweight set as +0 for a rep PR', () => {
+        const session = {
+          ...makePreset(),
+          exercises: [dips([bodyweightSet(1, null, 12)])],
+        } as unknown as PresetSession;
+        expect(
+          isPrSet(
+            session,
+            '1',
+            { '1': 1 },
+            { 'x-dips': { weight: null, reps: 10 } }
+          )
+        ).toBe(true);
+        expect(
+          isPrSet(
+            session,
+            '1',
+            { '1': 1 },
+            { 'x-dips': { weight: 5, reps: 5 } }
+          )
+        ).toBe(false);
+      });
+
+      it('counts body weight in the completion summary volume', () => {
+        const session = {
+          ...makePreset(),
+          exercises: [dips([bodyweightSet(1, 20), bodyweightSet(2, -30)])],
+        } as unknown as PresetSession;
+        const summary = buildWorkoutCompletionSummary(
+          session,
+          { '1': 1, '2': 2 },
+          {},
+          i18n.t,
+          80
+        );
+        expect(summary.volumeKg).toBe(100 * 8 + 50 * 8);
+      });
+    });
+
     describe('setVolumeKg / getExerciseVolumeKg', () => {
       const set = (
         weight: number | null,
@@ -3475,6 +3683,16 @@ describe('workoutSession', () => {
         };
         expect(getExerciseVolumeKg(exercise as any)).toBe(600 + 560);
       });
+
+      it('excludes Warm-up and Warmup spellings from exercise volume', () => {
+        for (const setType of ['Warmup', 'Warm-up', 'Warm-up Set']) {
+          const exercise = {
+            exercise_snapshot: null,
+            sets: [set(40, 12, setType), set(60, 10)],
+          };
+          expect(getExerciseVolumeKg(exercise as any)).toBe(600);
+        }
+      });
     });
 
     describe('formatVolume', () => {
@@ -3491,6 +3709,29 @@ describe('workoutSession', () => {
         reps: number | null,
         setType: string | null = null
       ) => ({ setNumber: 1, setType, weight, reps });
+
+      it('formats weighted carries as weight × distance in metres or yards', () => {
+        const carry = { ...recentSet(40, null), distance: 0.03 };
+        expect(
+          formatRecentSessionSet(carry, 'kg', i18n.t, 'weight_distance', 'km')
+        ).toBe('40 × 30 m');
+        expect(
+          formatRecentSessionSet(
+            carry,
+            'kg',
+            i18n.t,
+            'weight_distance',
+            'miles'
+          )
+        ).toBe('40 × 32.8 yd');
+      });
+
+      it('formats loaded holds as weight × time', () => {
+        const hold = { ...recentSet(20, null), duration: 90 };
+        expect(
+          formatRecentSessionSet(hold, 'kg', i18n.t, 'weight_duration')
+        ).toBe('20 × 1:30');
+      });
 
       it('formats weight × reps, converting for the display unit', () => {
         expect(formatRecentSessionSet(recentSet(100, 5), 'kg', i18n.t)).toBe(
@@ -3873,6 +4114,45 @@ describe('workoutSession', () => {
         setType,
         weight,
         reps,
+      });
+
+      it('keeps warm-ups added ahead of the working sets from taking their history', () => {
+        const sets = [
+          makeSet(1, { set_type: 'warmup' }),
+          makeSet(2, { set_type: 'warmup' }),
+          makeSet(3),
+          makeSet(4),
+        ];
+        const previous = [prev(70, 14), prev(90, 10)];
+        const aligned = alignPreviousSets(sets, previous);
+        expect(aligned[0]).toBeUndefined();
+        expect(aligned[1]).toBeUndefined();
+        expect(aligned[2]).toBe(previous[0]);
+        expect(aligned[3]).toBe(previous[1]);
+        expect(resolveAssumedSetValues(sets, previous)[2]).toMatchObject({
+          weight: 70,
+          reps: 14,
+        });
+      });
+
+      it("pairs warm-ups with last time's warm-ups and working sets with its working sets", () => {
+        const sets = [
+          makeSet(1, { set_type: 'warmup' }),
+          makeSet(2),
+          makeSet(3),
+        ];
+        const previous = [prev(40, 10, 'warmup'), prev(100, 8), prev(100, 6)];
+        expect(alignPreviousSets(sets, previous)).toEqual([
+          previous[0],
+          previous[1],
+          previous[2],
+        ]);
+        // No warm-ups planned this time: the working sets still take the
+        // working history, not last time's warm-up.
+        expect(alignPreviousSets([makeSet(2), makeSet(3)], previous)).toEqual([
+          previous[1],
+          previous[2],
+        ]);
       });
 
       it('assumes each set from its same-position previous-session set', () => {
@@ -4436,6 +4716,31 @@ describe('workoutSession', () => {
           expect(result?.suggestedWeight).toBeCloseTo(105, 5);
         });
 
+        it('suggests the weight as typed, not the kg round-trip noise', () => {
+          // Storage is numeric(6,2) kg: 90 lb is kept as 40.82 kg (89.99… lb)
+          // and a 5 lb increment as 2.27 kg (5.004… lb).
+          const result = evaluateExerciseProgression(
+            {
+              progression_mode: 'rep_goal',
+              rep_goal: 45,
+              increment_type: 'weight',
+              increment_value: 2.27,
+            },
+            [
+              { set_type: 'normal' },
+              { set_type: 'normal' },
+              { set_type: 'normal' },
+            ],
+            [prev(40.82, 15), prev(40.82, 15), prev(40.82, 15)],
+            'lbs'
+          );
+          expect(result?.status).toBe('PROGRESSION_WEIGHT_INCREASE');
+          expect(result?.suggestedWeight).toBe(95);
+          expect(result?.message).toBe(
+            'Rep goal met (45/45 reps)! Increasing weight to 95.'
+          );
+        });
+
         it('treats a step-load increment as reps even when stored as weight', () => {
           // AI-created step-load presets default increment_type to weight.
           const result = evaluateExerciseProgression(
@@ -4832,6 +5137,40 @@ describe('workoutSession', () => {
             rest_time: 30,
             notes: 'hold',
             rpe: 8,
+          });
+        });
+
+        it('converts carry distance from metres/yards to km on weight_distance', () => {
+          const metres = buildActivitySetsPayload(
+            [{ clientId: 'set-0', weight: '40', reps: '', distance: '30' }],
+            new Map(),
+            'kg',
+            'weight_distance'
+          );
+          expect(metres[0]).toMatchObject({ weight: 40, reps: null });
+          expect(metres[0].distance).toBeCloseTo(0.03, 6);
+          const yards = buildActivitySetsPayload(
+            [{ clientId: 'set-0', weight: '40', reps: '', distance: '100' }],
+            new Map(),
+            'kg',
+            'weight_distance',
+            undefined,
+            'miles'
+          );
+          expect(yards[0].distance).toBeCloseTo(0.09144, 4);
+        });
+
+        it('takes duration from the drafts on weight_duration', () => {
+          const payload = buildActivitySetsPayload(
+            [{ clientId: 'set-0', weight: '20', reps: '', duration: 90 }],
+            new Map(),
+            'kg',
+            'weight_duration'
+          );
+          expect(payload[0]).toMatchObject({
+            weight: 20,
+            reps: null,
+            duration: 90,
           });
         });
 
@@ -5570,6 +5909,55 @@ describe('workoutSession', () => {
           allCompleted(session)
         )
       ).toBeNull();
+    });
+
+    describe('structureOnly', () => {
+      it('ignores a weight or reps change', () => {
+        const session = makePreset({
+          exercises: [
+            makeSessionExercise({
+              sets: [makeSessionSet({ weight: 105, reps: 8 })],
+            }),
+          ],
+        });
+        expect(
+          buildPresetUpdateExercises(session, makeTargetPreset(), {
+            ...allCompleted(session),
+            structureOnly: true,
+          })
+        ).toBeNull();
+      });
+
+      it('still reports an added set', () => {
+        const session = makePreset({
+          exercises: [
+            makeSessionExercise({
+              sets: [makeSessionSet(), makeSessionSet({ id: 102 })],
+            }),
+          ],
+        });
+        const payload = buildPresetUpdateExercises(
+          session,
+          makeTargetPreset(),
+          { ...allCompleted(session), structureOnly: true }
+        );
+        expect(payload?.[0]?.sets).toHaveLength(2);
+      });
+
+      it('still reports an added exercise', () => {
+        const session = makePreset({
+          exercises: [
+            makeSessionExercise(),
+            makeSessionExercise({ id: 'entry-2', exercise_id: EX_B }),
+          ],
+        });
+        expect(
+          buildPresetUpdateExercises(session, makeTargetPreset(), {
+            ...allCompleted(session),
+            structureOnly: true,
+          })
+        ).not.toBeNull();
+      });
     });
 
     it('returns the full payload when a completed set value changed', () => {

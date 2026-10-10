@@ -1,6 +1,10 @@
 import { useCallback, useReducer, useRef } from 'react';
 import type { PresetSessionResponse, WorkoutFormat } from '@workspace/shared';
-import { distanceFromKm, weightFromKg } from '../utils/unitConversions';
+import { weightFromKg } from '../utils/unitConversions';
+import {
+  resolveSnapshotModality,
+  setDistanceFromKm,
+} from '../utils/workoutSession';
 import type { WorkoutDraftExercise, DraftSetType } from '../types/drafts';
 import type { WorkoutPreset } from '../types/workoutPresets';
 import {
@@ -84,6 +88,7 @@ export function presetFormReducer(
           exerciseCategory: exercise.category ?? null,
           exerciseModality: exercise.modality ?? null,
           images: exercise.image_url ? [exercise.image_url] : [],
+          exerciseEquipment: exercise.equipment ?? null,
           supersetGroup: exercise.superset_group ?? null,
           // Progression & Equipment Fields
           progressionMode: exercise.progression_mode ?? 'rep_goal',
@@ -108,9 +113,14 @@ export function presetFormReducer(
               set.distance != null
                 ? String(
                     parseFloat(
-                      distanceFromKm(set.distance, action.distanceUnit).toFixed(
-                        2
-                      )
+                      setDistanceFromKm(
+                        set.distance,
+                        action.distanceUnit,
+                        resolveSnapshotModality({
+                          modality: exercise.modality,
+                          category: exercise.category,
+                        })
+                      ).toFixed(2)
                     )
                   )
                 : '',
@@ -138,6 +148,8 @@ export function presetFormReducer(
           exerciseCategory: exercise.exercise_snapshot?.category ?? null,
           exerciseModality: exercise.exercise_snapshot?.modality ?? null,
           images: exercise.exercise_snapshot?.images ?? [],
+          exerciseEquipment: exercise.exercise_snapshot?.equipment ?? null,
+          snapshot: exercise.exercise_snapshot ?? null,
           supersetGroup: exercise.superset_group ?? null,
           sets: exercise.sets.map((set, setIdx) => ({
             clientId: action.clientIds[exerciseIdx].setClientIds[setIdx],
@@ -158,9 +170,11 @@ export function presetFormReducer(
               set.distance != null
                 ? String(
                     parseFloat(
-                      distanceFromKm(set.distance, action.distanceUnit).toFixed(
-                        2
-                      )
+                      setDistanceFromKm(
+                        set.distance,
+                        action.distanceUnit,
+                        resolveSnapshotModality(exercise.exercise_snapshot)
+                      ).toFixed(2)
                     )
                   )
                 : '',
@@ -192,6 +206,7 @@ export function useWorkoutPresetForm() {
     replaceExercise,
     duplicateExercise,
     addSet,
+    addWarmupSets,
     removeSet,
     updateSetField,
     updateSetMeta,
@@ -283,6 +298,7 @@ export function useWorkoutPresetForm() {
     replaceExercise,
     duplicateExercise,
     addSet,
+    addWarmupSets,
     removeSet,
     updateSetField,
     updateSetMeta,

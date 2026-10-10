@@ -22,6 +22,22 @@ struct PlannedSet: Codable, Equatable, Identifiable {
     /// Drives the label above the values ("Warmup 1/2" rather than "Set 1/2");
     /// nil or an unrecognised value just reads as a normal set.
     let setType: String?
+    /// Hold length in seconds. Nil on a reps set. The watch counts this down
+    /// instead of offering a reps box.
+    var targetDurationSec: Int? = nil
+    /// Last session's time for this set, shown in gray on an idle stopwatch.
+    var previousDurationSec: Int? = nil
+    /// A duration exercise. With no `targetDurationSec` the watch shows a
+    /// stopwatch instead of a reps box. Nil from a phone that predates it.
+    var timed: Bool? = nil
+    /// A weighted carry: weight and distance, no reps. The watch shows a
+    /// distance box (metres) in place of the reps box.
+    var carry: Bool? = nil
+    /// Planned carry distance in km.
+    var targetDistanceKm: Double? = nil
+    /// A loaded hold: the weight box stays beside the timer even when no
+    /// weight is planned yet.
+    var weighted: Bool? = nil
 
     var id: String { setId }
 }
@@ -36,15 +52,19 @@ struct PlannedExercise: Codable, Equatable, Identifiable {
     /// this exercise is on its own. The phone only sets it for an adjacent
     /// run of two or more, so the watch does not repeat that rule.
     let supersetRun: Int?
+    /// A bodyweight exercise: its weight is a signed change to body weight
+    /// (+ added, − assisted). Optional so a snapshot saved before this existed
+    /// still decodes, and an older phone that never sends it reads as false.
+    var bodyweight: Bool? = nil
     let sets: [PlannedSet]
 
     var id: String { exerciseEntryId }
 }
 
 /// The workout the phone armed the watch with. Sent once, in full, at the
-/// start of the session — there is no partial update, only a fresh
-/// `workoutStart` (a phone-side edit mid-workout is out of scope for the
-/// watch, which only ever reflects what existed the moment it began).
+/// start of the session. Its set targets are the values known at that moment;
+/// later `setTargets` messages replace them (see
+/// `WorkoutSessionStore.targetOverrides`) without re-sending the plan.
 struct ActiveWorkoutPlan: Codable, Equatable {
     /// The live-workout session id (`activeWorkoutStore.sessionId` on the
     /// phone) — every message about this workout carries it, so the phone
@@ -74,6 +94,9 @@ struct ActiveWorkoutPlan: Codable, Equatable {
     let excludedPauseSeconds: Int?
     /// Phone's pause/resume counter. A lower number is an older message.
     let intervalRevision: Int?
+    /// The workout was started from a saved one, so Finish asks whether to
+    /// update it when the exercises or sets changed. Nil from an older phone.
+    let fromPreset: Bool?
 
     init(
         sessionId: String,
@@ -87,7 +110,8 @@ struct ActiveWorkoutPlan: Codable, Equatable {
         capEndsAt: Date? = nil,
         pausedAt: Date? = nil,
         excludedPauseSeconds: Int? = nil,
-        intervalRevision: Int? = nil
+        intervalRevision: Int? = nil,
+        fromPreset: Bool? = nil
     ) {
         self.sessionId = sessionId
         self.workoutName = workoutName
@@ -101,6 +125,7 @@ struct ActiveWorkoutPlan: Codable, Equatable {
         self.pausedAt = pausedAt
         self.excludedPauseSeconds = excludedPauseSeconds
         self.intervalRevision = intervalRevision
+        self.fromPreset = fromPreset
     }
 }
 
@@ -167,12 +192,43 @@ struct WorkoutStep: Identifiable, Equatable {
     }
 }
 
+/// Totals shown on the watch once a workout is finished.
+struct WorkoutSummary: Equatable {
+    let durationSeconds: Int
+    let setsCompleted: Int
+    let volumeKg: Double
+    let averageBpm: Double?
+    let maxBpm: Double?
+    let activeEnergyKcal: Double?
+    /// The workout it describes, so a question the phone asks about it can be
+    /// matched to this summary and not to a later one.
+    var sessionId: String? = nil
+}
+
 /// What the wearer actually did for a set, once they have adjusted the
 /// targets. Absent fields mean "unchanged from target" — the watch only
 /// records an override when a value is edited.
 struct SetValues: Codable, Equatable {
     var weightKg: Double?
     var reps: Double?
+    /// Hold length from a later `setTargets` update, in seconds. Nil leaves
+    /// the plan's `targetDurationSec`.
+    var durationSec: Int? = nil
+    /// Last session's time from a `setTargets` update, in seconds.
+    var previousDurationSec: Int? = nil
+    /// A carry's distance in km. Nil leaves the plan's value.
+    var distanceKm: Double? = nil
+}
+
+/// The phone's rest timer, as carried by a `setTargets` update.
+enum PhoneRest: Codable, Equatable {
+    /// Counting down to `endsAt`.
+    case resting(endsAt: Date, durationSeconds: Int)
+    /// Paused on the phone. The watch freezes its countdown until the phone
+    /// resumes (a new `.resting` deadline) or ends it.
+    case paused
+    /// No rest: skipped, run out, or never started.
+    case ready
 }
 
 /// One completed set, as reported to the phone. `setId` must be one of the
@@ -191,6 +247,12 @@ struct CompletedSet: Codable, Equatable {
     let setId: String
     let weightKg: Double?
     let reps: Double?
+    /// Seconds the hold countdown ran. Nil when it was never started.
+    var duration: Int? = nil
+    /// A carry's distance in km, entered in metres on the watch.
+    var distanceKm: Double? = nil
+    /// Effort (6 to 10) the wearer picked. Nil when skipped.
+    var rpe: Double? = nil
     /// When the wearer tapped the set, not when the phone received it.
     let completedAt: Date
 }

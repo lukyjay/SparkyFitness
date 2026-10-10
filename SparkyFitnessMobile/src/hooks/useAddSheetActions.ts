@@ -306,6 +306,16 @@ export function useAddSheetActions({ syncMutation }: AddSheetActionsArgs) {
     navigateFromSheet('ProgressPhotos', { date });
   }, [getActiveDiaryDate, navigateFromSheet]);
 
+  const handleAddSymptoms = useCallback(() => {
+    const date = getActiveDiaryDate();
+    navigateFromSheet('SymptomLog', { date });
+  }, [getActiveDiaryDate, navigateFromSheet]);
+
+  const handleAddMood = useCallback(() => {
+    const date = getActiveDiaryDate();
+    navigateFromSheet('MoodLog', { date });
+  }, [getActiveDiaryDate, navigateFromSheet]);
+
   const handleAskSparky = useCallback(() => {
     navigateFromSheet('Chat');
   }, [navigateFromSheet]);
@@ -383,6 +393,8 @@ export function useAddSheetActions({ syncMutation }: AddSheetActionsArgs) {
     handleAddActivity,
     handleAddMeasurements,
     handleAddProgressPhotos,
+    handleAddSymptoms,
+    handleAddMood,
     handleAskSparky,
     handleOpenCycle,
     handleSyncHealthData,

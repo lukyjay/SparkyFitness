@@ -4,22 +4,24 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { AppState } from 'react-native';
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
-import type {
-  ExerciseEntryResponse,
-  ExerciseEntrySetResponse,
-  ExerciseModality,
-  ExerciseCoachingSignal,
-  ExerciseRecentSessionSet,
-  ExerciseSnapshotResponse,
-  IntervalEngineStep,
-  IntervalPhase,
-  PresetSessionResponse,
-  WorkoutFormat,
-  DropSetWeightUnit,
-} from '@workspace/shared';
 import {
+  type ExerciseEntryResponse,
+  type ExerciseEntrySetResponse,
+  type ExerciseModality,
+  type ExerciseCoachingSignal,
+  type ExerciseRecentSessionSet,
+  type ExerciseSnapshotResponse,
+  type IntervalEngineStep,
+  type IntervalPhase,
+  type PresetSessionResponse,
+  type WorkoutFormat,
+  type DropSetWeightUnit,
   buildIntervalPhases,
   calculateDropSetWeightsKg,
+  calculateWarmupSets,
+  type WarmupOptions,
+  isWarmupSetType,
+  WARMUP_REST_SEC,
   shiftPhasesForPause,
 } from '@workspace/shared';
 import type { Exercise } from '../types/exercise';
@@ -32,6 +34,8 @@ import {
   isCardioModality,
   isDropSetType,
   isDurationModality,
+  isWeightDistanceModality,
+  isWeightDurationModality,
   isPrSet,
   moveSessionExerciseItem,
   normalizeSessionSupersetGroups,
@@ -56,6 +60,8 @@ import {
   scheduleRestNotification,
 } from '../services/notifications';
 import { fireSelectionHaptic, fireSuccessHaptic } from '../services/haptics';
+import { setRestKeepAlive } from '../services/sounds';
+import { useAppPreferencesStore } from './appPreferencesStore';
 import { addLog } from '../services/LogService';
 import WatchConnectivity from '../../modules/watch-connectivity';
 
@@ -97,6 +103,17 @@ export function syncWatchIntervalTiming(timing: {
 
 /** Monotonic counter used to reject stale async schedule resolutions. */
 let restInstanceCounter = 0;
+
+/** Sessions the user threw away, until the watch bridge has been told. */
+const discardedWorkoutIds = new Set<string>();
+
+/**
+ * True once if `sessionId` was cleared as a discard rather than a finish. The
+ * watch bridge reads it when the session ends.
+ */
+export function consumeWorkoutDiscarded(sessionId: string): boolean {
+  return discardedWorkoutIds.delete(sessionId);
+}
 
 export interface WorkoutStep {
   exerciseId: string;
@@ -296,6 +313,14 @@ export interface ActiveWorkoutState {
    */
   watchIntervalRevision: number;
   watchExcludedPauseMs: number;
+  /**
+   * `armedAt` (epoch ms) of the last `startWorkout` sent to the watch for this
+   * session, null until one is. Set targets are only sent once armed and
+   * carry it, so the watch can tell a re-armed saved session from the
+   * earlier arm that used the same session id. Persisted so a JS restart
+   * keeps syncing the plan the watch is still running.
+   */
+  watchArmedAt: number | null;
   intervalRoundsCompleted: number;
   intervalRepsCompleted: number;
   intervalStatus: 'rx' | 'scaled';
@@ -357,7 +382,12 @@ export interface ActiveWorkoutState {
   setAdaptiveDeclined: (entryId: string, declined: boolean) => void;
   /** Keep ramp rounding in step with a mid-workout unit preference change. */
   setWeightUnit: (unit: 'kg' | 'lbs') => void;
-  clearWorkout: () => void;
+  /**
+   * Ends the live workout. `discarded` marks it as thrown away rather than
+   * finished, which the watch bridge reads (`consumeWorkoutDiscarded`) so the
+   * watch drops its workout instead of saving it to Health.
+   */
+  clearWorkout: (options?: { discarded?: boolean }) => void;
   /**
    * Complete any set — not just the cursor — and move the next-up highlight to
    * the set right after it, starting the rest before that set. Sets log in any
@@ -409,8 +439,13 @@ export interface ActiveWorkoutState {
 
   /** Patch value fields on a set. Weight is in kg — UI converts before calling. */
   updateSetField: (setId: string, patch: ActiveSetPatch) => void;
-  /** Start a timed/hold set's stopwatch. */
-  startSetTimer: (setId: string) => void;
+  /**
+   * Start a timed/hold set's stopwatch. `startedAt` (epoch ms) is for a timer
+   * the watch already started; omitted, it starts now.
+   */
+  startSetTimer: (setId: string, startedAt?: number) => void;
+  /** Drop a set's stopwatch without writing a duration. */
+  clearSetTimer: (setId: string) => void;
   /**
    * Move a running stopwatch's start forward by `deltaMs`, so time spent
    * paused (guided mode's Pause) is not counted. No-op when none is running.
@@ -434,6 +469,18 @@ export interface ActiveWorkoutState {
     entryId: string,
     baseWeightKg: number,
     unit: DropSetWeightUnit
+  ) => void;
+  /**
+   * Insert ramping warm-up sets (bar, then 50 / 70 / 85% of the working
+   * weight) ahead of the exercise's first working set. Warm-ups that have not
+   * been logged are replaced, so tapping again does not stack them; one that
+   * has been logged stops the action, since the ramp is already under way.
+   */
+  addWarmupSetsToExercise: (
+    entryId: string,
+    workingWeightKg: number,
+    unit: DropSetWeightUnit,
+    options?: WarmupOptions
   ) => void;
   /**
    * Delete a set, renumbering the rest. Deleting an exercise's last remaining
@@ -514,11 +561,16 @@ export interface ActiveWorkoutState {
    * moment: a mid-flight reorder or delete breaks the positional graft, so
    * the graft is skipped when the local prefix no longer matches (the still-
    * dirty session is resent by the pending debounce or trailing save).
+   * `sentSetIds`, when captured, is each exercise's set-id order at that
+   * same moment. Inserting warm-ups (or any other set-order or set-count
+   * change) while the save is in flight would map the server ids onto the
+   * new sets, so the graft is skipped and the newer shape gets its own save.
    */
   applyServerSession: (
     serverSession: PresetSessionResponse,
     sentRevision: number,
-    sentEntryIds: string[]
+    sentEntryIds: string[],
+    sentSetIds?: string[][]
   ) => void;
 }
 
@@ -571,6 +623,7 @@ const initialData: Pick<
   | 'intervalPauseStartedAt'
   | 'watchIntervalRevision'
   | 'watchExcludedPauseMs'
+  | 'watchArmedAt'
   | 'intervalRoundsCompleted'
   | 'intervalRepsCompleted'
   | 'intervalStatus'
@@ -607,6 +660,7 @@ const initialData: Pick<
   intervalPauseStartedAt: null,
   watchIntervalRevision: 0,
   watchExcludedPauseMs: 0,
+  watchArmedAt: null,
   intervalRoundsCompleted: 0,
   intervalRepsCompleted: 0,
   intervalStatus: 'rx',
@@ -691,11 +745,12 @@ export function buildStepsFromSession(
  * Map local set ids → server set ids by position (exercise index, set index).
  *
  * Valid because the autosave payload preserves order and the server recreates
- * in order. Most shape-changing edits are append-only (`addSet`/`addExercise`
- * append, `deleteSet` shifts down), but `supersetWith`/`ungroupExercise` can
- * reorder exercises — so `applyServerSession` guards its graft branch by
- * comparing the local entry-id prefix against the ids captured at send time
- * and skips the graft (staying dirty) when they diverge.
+ * in order. A reorder of exercises (`supersetWith` / `ungroupExercise`), or
+ * a change in set order or count while a save is in flight (warm-ups
+ * prepended onto `[101, 102]`), does not. `applyServerSession` skips the
+ * graft when the local entry-id prefix no longer matches, or when a captured
+ * set-id snapshot differs. Callers that omit the snapshot keep grafting an
+ * append or a delete, which still share a prefix of the sets that were sent.
  *
  * Positions beyond the shorter side are unmapped — callers keep the local id
  * (temp ids re-save on the next autosave; id churn only, no data loss).
@@ -848,13 +903,19 @@ function adoptAssumedSetValues(
   const modality = resolveSnapshotModality(exercise.exercise_snapshot);
   const durationLike = isDurationModality(modality);
   const cardio = isCardioModality(modality);
+  const weightDuration = isWeightDurationModality(modality);
+  const weightDistance = isWeightDistanceModality(modality);
   const relevantFilled = cardio
     ? target.duration != null && target.distance != null
     : durationLike
       ? target.duration != null
-      : modality === 'reps_only'
-        ? target.reps != null
-        : target.weight != null && target.reps != null;
+      : weightDuration
+        ? target.weight != null && target.duration != null
+        : weightDistance
+          ? target.weight != null && target.distance != null
+          : modality === 'reps_only'
+            ? target.reps != null
+            : target.weight != null && target.reps != null;
   if (relevantFilled) return session;
 
   const assumed = resolveLiveAssumedSetValues(
@@ -869,12 +930,22 @@ function adoptAssumedSetValues(
       }
     : durationLike
       ? { duration: target.duration ?? assumed.duration ?? null }
-      : modality === 'reps_only'
-        ? { reps: target.reps ?? assumed.reps }
-        : {
+      : weightDuration
+        ? {
             weight: target.weight ?? assumed.weight,
-            reps: target.reps ?? assumed.reps,
-          };
+            duration: target.duration ?? assumed.duration ?? null,
+          }
+        : weightDistance
+          ? {
+              weight: target.weight ?? assumed.weight,
+              distance: target.distance ?? assumed.distance ?? null,
+            }
+          : modality === 'reps_only'
+            ? { reps: target.reps ?? assumed.reps }
+            : {
+                weight: target.weight ?? assumed.weight,
+                reps: target.reps ?? assumed.reps,
+              };
   if (Object.values(patch).every((v) => v == null)) return session;
 
   return {
@@ -1132,6 +1203,29 @@ function scheduleGuardedRestNotification(
 }
 
 /**
+ * Schedule the rest-complete notification for the rest identified by `token`,
+ * `seconds` from now, describing the active set: the path every running rest
+ * other than a fresh start goes through (resume, ±15s, a settings change).
+ */
+function scheduleActiveSetRestNotification(
+  state: Pick<ActiveWorkoutState, 'steps' | 'activeSetId' | 'session'>,
+  seconds: number,
+  token: number
+): void {
+  const { steps, activeSetId } = state;
+  const step =
+    activeSetId != null ? steps.find((s) => s.setId === activeSetId) : null;
+  const exerciseName = step?.exerciseName ?? 'Rest';
+  const content = buildRestNotificationContent(
+    i18n.getFixedT(i18n.language),
+    state.session,
+    activeSetId,
+    exerciseName
+  );
+  scheduleGuardedRestNotification(exerciseName, seconds, token, content);
+}
+
+/**
  * Start a rest timer for the step identified by `setId`, scheduling the local
  * notification and wiring up the stale-resolution guard on the returned
  * promise. Returns the new Rest value the caller should commit to state.
@@ -1140,13 +1234,28 @@ function startRestForStep(
   steps: WorkoutStep[],
   setId: string,
   session: PresetSessionResponse | null,
-  durationSecOverride?: number
+  durationSecOverride?: number,
+  /**
+   * When the rest began, if before now: a set the watch logged is only
+   * reported once the wearer picks an effort, and the watch's rest has been
+   * running since the tap. Starting this one from "now" would put its end
+   * later than the watch's and restart the watch's timer.
+   */
+  startedAtMs?: number
 ): Rest {
   const step = steps.find((s) => s.setId === setId);
   const durationSec =
     durationSecOverride ?? step?.restSec ?? getDefaultRestSec();
+  const now = Date.now();
+  const startedAt =
+    startedAtMs != null && Number.isFinite(startedAtMs) && startedAtMs < now
+      ? startedAtMs
+      : now;
+  const endsAt = startedAt + durationSec * 1000;
+  // The break is already over: nothing to count down.
+  if (endsAt <= now) return READY_REST;
+  const remainingSec = Math.max(1, Math.ceil((endsAt - now) / 1000));
   const token = ++restInstanceCounter;
-  const endsAt = Date.now() + durationSec * 1000;
 
   const rest: Rest = {
     state: 'resting',
@@ -1164,7 +1273,7 @@ function startRestForStep(
     setId,
     exerciseName
   );
-  scheduleGuardedRestNotification(exerciseName, durationSec, token, content);
+  scheduleGuardedRestNotification(exerciseName, remainingSec, token, content);
 
   return rest;
 }
@@ -1288,6 +1397,7 @@ export const useActiveWorkoutStore = create<ActiveWorkoutState>()(
           intervalPauseStartedAt: null,
           watchIntervalRevision: 0,
           watchExcludedPauseMs: 0,
+          watchArmedAt: null,
           intervalRoundsCompleted: 0,
           intervalRepsCompleted: 0,
           intervalStatus: 'rx',
@@ -1353,6 +1463,7 @@ export const useActiveWorkoutStore = create<ActiveWorkoutState>()(
           intervalPauseStartedAt: null,
           watchIntervalRevision: 0,
           watchExcludedPauseMs: 0,
+          watchArmedAt: null,
           intervalRoundsCompleted: 0,
           intervalRepsCompleted: 0,
           intervalStatus: 'rx',
@@ -1585,7 +1696,11 @@ export const useActiveWorkoutStore = create<ActiveWorkoutState>()(
         if (get().weightUnit !== unit) set({ weightUnit: unit });
       },
 
-      clearWorkout: () => {
+      clearWorkout: (options) => {
+        const endingSessionId = get().sessionId;
+        if (options?.discarded && endingSessionId != null) {
+          discardedWorkoutIds.add(endingSessionId);
+        }
         cancelCurrentRestNotification(get().rest);
         // The unit is a preference, not workout state; keep it across clears.
         set({ ...initialData, weightUnit: get().weightUnit });
@@ -1674,7 +1789,13 @@ export const useActiveWorkoutStore = create<ActiveWorkoutState>()(
           // of 0) advances straight to ready — no timer flash.
           rest:
             restSec > 0
-              ? startRestForStep(state.steps, nextStep.setId, session, restSec)
+              ? startRestForStep(
+                  state.steps,
+                  nextStep.setId,
+                  session,
+                  restSec,
+                  completedSetIds[setId]
+                )
               : READY_REST,
           sessionRevision: state.sessionRevision + 1,
           hasUnsavedChanges: true,
@@ -1800,7 +1921,7 @@ export const useActiveWorkoutStore = create<ActiveWorkoutState>()(
 
       resumeRest: () => {
         const state = get();
-        const { rest, steps, activeSetId } = state;
+        const { rest } = state;
         if (rest.state !== 'paused' || rest.pausedRemainingMs == null) return;
 
         const remainingMs = rest.pausedRemainingMs;
@@ -1818,24 +1939,16 @@ export const useActiveWorkoutStore = create<ActiveWorkoutState>()(
           },
         });
 
-        const step =
-          activeSetId != null
-            ? steps.find((s) => s.setId === activeSetId)
-            : null;
-        const exerciseName = step?.exerciseName ?? 'Rest';
-        const seconds = Math.max(1, Math.ceil(remainingMs / 1000));
-        const content = buildRestNotificationContent(
-          i18n.getFixedT(i18n.language),
-          state.session,
-          activeSetId,
-          exerciseName
+        scheduleActiveSetRestNotification(
+          state,
+          Math.max(1, Math.ceil(remainingMs / 1000)),
+          token
         );
-        scheduleGuardedRestNotification(exerciseName, seconds, token, content);
       },
 
       adjustRest: (deltaSec) => {
         const state = get();
-        const { rest, steps, activeSetId } = state;
+        const { rest } = state;
         const deltaMs = deltaSec * 1000;
 
         if (rest.state === 'resting' && rest.endsAt != null) {
@@ -1860,26 +1973,10 @@ export const useActiveWorkoutStore = create<ActiveWorkoutState>()(
             },
           });
 
-          const step =
-            activeSetId != null
-              ? steps.find((s) => s.setId === activeSetId)
-              : null;
-          const exerciseName = step?.exerciseName ?? 'Rest';
-          const seconds = Math.max(
-            1,
-            Math.ceil((newEndsAt - Date.now()) / 1000)
-          );
-          const content = buildRestNotificationContent(
-            i18n.getFixedT(i18n.language),
-            state.session,
-            activeSetId,
-            exerciseName
-          );
-          scheduleGuardedRestNotification(
-            exerciseName,
-            seconds,
-            token,
-            content
+          scheduleActiveSetRestNotification(
+            state,
+            Math.max(1, Math.ceil((newEndsAt - Date.now()) / 1000)),
+            token
           );
           return;
         }
@@ -1986,12 +2083,23 @@ export const useActiveWorkoutStore = create<ActiveWorkoutState>()(
         });
       },
 
-      startSetTimer: (setId) => {
+      startSetTimer: (setId, startedAt) => {
         const { setTimerStartedAt } = get();
         if (setTimerStartedAt[setId] != null) return;
         set({
-          setTimerStartedAt: { ...setTimerStartedAt, [setId]: Date.now() },
+          setTimerStartedAt: {
+            ...setTimerStartedAt,
+            [setId]: startedAt ?? Date.now(),
+          },
         });
+      },
+
+      clearSetTimer: (setId) => {
+        const { setTimerStartedAt } = get();
+        if (setTimerStartedAt[setId] == null) return;
+        const rest = { ...setTimerStartedAt };
+        delete rest[setId];
+        set({ setTimerStartedAt: rest });
       },
 
       shiftSetTimer: (setId, deltaMs) => {
@@ -2070,8 +2178,13 @@ export const useActiveWorkoutStore = create<ActiveWorkoutState>()(
               set_number: exercise.sets.length + 1,
               weight: null,
               reps: null,
-              ...(durationLike ? { duration: null } : {}),
-              ...(isCardioModality(modality) ? { distance: null } : {}),
+              ...(durationLike || isWeightDurationModality(modality)
+                ? { duration: null }
+                : {}),
+              ...(isCardioModality(modality) ||
+              isWeightDistanceModality(modality)
+                ? { distance: null }
+                : {}),
               notes: null,
               rpe: null,
               completed_at: null,
@@ -2129,6 +2242,79 @@ export const useActiveWorkoutStore = create<ActiveWorkoutState>()(
           ),
         };
         set(buildSessionEditState(state, next));
+      },
+
+      addWarmupSetsToExercise: (entryId, workingWeightKg, unit, options) => {
+        const state = get();
+        const session = state.session;
+        if (!session) return;
+        const exercise = session.exercises.find((e) => e.id === entryId);
+        if (!exercise) return;
+
+        const warmups = calculateWarmupSets(workingWeightKg, unit, options);
+        if (warmups.length === 0) return;
+
+        const isLogged = (s: ExerciseEntrySetResponse) =>
+          state.completedSetIds[String(s.id)] != null || s.completed_at != null;
+        if (
+          exercise.sets.some((s) => isWarmupSetType(s.set_type) && isLogged(s))
+        )
+          return;
+
+        // None of the old warm-ups is logged (checked above), so all of them go
+        // and the new ramp leads the working sets.
+        const working = exercise.sets.filter(
+          (s) => !isWarmupSetType(s.set_type)
+        );
+
+        let tempId = nextTempSetId(session, state.setRenderKeys);
+        const warmupSets: ExerciseEntrySetResponse[] = warmups.map((w) => {
+          const created: ExerciseEntrySetResponse = {
+            id: tempId,
+            set_number: 0,
+            set_type: 'warmup',
+            weight: w.weightKg,
+            reps: w.reps,
+            duration: null,
+            distance: null,
+            rest_time: WARMUP_REST_SEC,
+            notes: null,
+            rpe: null,
+            rir: null,
+            is_pr: false,
+            completed_at: null,
+          };
+          tempId -= 1;
+          return created;
+        });
+
+        const sets = [...warmupSets, ...working].map((s, i) => ({
+          ...s,
+          set_number: i + 1,
+        }));
+        const next: PresetSessionResponse = {
+          ...session,
+          exercises: session.exercises.map((e) =>
+            e.id === entryId ? { ...e, sets } : e
+          ),
+        };
+        const edited = buildSessionEditState(state, next);
+        // The first working set is still in the session, so the shared edit
+        // tail would leave the cursor on it and skip the new warm-ups. Move
+        // onto the first warm-up, and drop any rest that belonged to the
+        // former cursor. A cursor on a later set, or another exercise, stays.
+        const firstWorkingId =
+          working.length > 0 ? String(working[0].id) : null;
+        if (
+          warmupSets.length > 0 &&
+          firstWorkingId != null &&
+          state.activeSetId === firstWorkingId
+        ) {
+          cancelCurrentRestNotification(state.rest);
+          edited.activeSetId = String(warmupSets[0].id);
+          edited.rest = READY_REST;
+        }
+        set(edited);
       },
 
       deleteSet: (setId) => {
@@ -2413,7 +2599,12 @@ export const useActiveWorkoutStore = create<ActiveWorkoutState>()(
         });
       },
 
-      applyServerSession: (serverSession, sentRevision, sentEntryIds) => {
+      applyServerSession: (
+        serverSession,
+        sentRevision,
+        sentEntryIds,
+        sentSetIds
+      ) => {
         const state = get();
         // The workout may have been cleared or replaced while the save was in
         // flight — a response for a different (or no) session is dropped.
@@ -2440,6 +2631,27 @@ export const useActiveWorkoutStore = create<ActiveWorkoutState>()(
             if (local.exercises[i].id !== sentEntryIds[i]) return;
           }
           if (local.exercises.length < sentEntryIds.length) return;
+
+          // A set inserted, deleted, or reordered after the payload was built
+          // (warm-ups prepended onto [101, 102]) would take the server ids of
+          // the sets that used to sit there. Skip; the newer shape is resent.
+          if (sentSetIds) {
+            const comparable = Math.min(
+              local.exercises.length,
+              sentEntryIds.length
+            );
+            for (let i = 0; i < comparable; i++) {
+              const sent = sentSetIds[i];
+              const localIds = local.exercises[i].sets.map((s) => String(s.id));
+              if (
+                sent == null ||
+                sent.length !== localIds.length ||
+                sent.some((id, j) => id !== localIds[j])
+              ) {
+                return;
+              }
+            }
+          }
 
           // Keep the newer local values; only graft the server-assigned ids
           // into place. Every logical set survives this, so the rest timer
@@ -2607,6 +2819,7 @@ export const useActiveWorkoutStore = create<ActiveWorkoutState>()(
         intervalPauseStartedAt: state.intervalPauseStartedAt,
         watchIntervalRevision: state.watchIntervalRevision,
         watchExcludedPauseMs: state.watchExcludedPauseMs,
+        watchArmedAt: state.watchArmedAt,
         intervalRoundsCompleted: state.intervalRoundsCompleted,
         intervalRepsCompleted: state.intervalRepsCompleted,
         intervalStatus: state.intervalStatus,
@@ -2664,7 +2877,10 @@ function syncRestDeadlineTimer(rest: Rest): void {
     clearTimeout(restDeadlineTimerId);
     restDeadlineTimerId = null;
   }
-  if (rest.state !== 'resting' || rest.endsAt == null) return;
+  const running = rest.state === 'resting' && rest.endsAt != null;
+  // Keeps this timer firing off screen when the background chime is on.
+  setRestKeepAlive(running);
+  if (!running || rest.endsAt == null) return;
   restDeadlineTimerId = setTimeout(
     () => {
       restDeadlineTimerId = null;
@@ -2684,6 +2900,36 @@ function syncRestDeadlineTimer(rest: Rest): void {
 // enough to keep the deadline timer in sync (including persist rehydration).
 useActiveWorkoutStore.subscribe((state, prevState) => {
   if (state.rest !== prevState.rest) syncRestDeadlineTimer(state.rest);
+});
+
+// The rest notification's sound and the background keep-alive are decided
+// when a rest is scheduled, from the rest-chime settings. Changing those
+// mid-rest reschedules the running rest's notification for the time left, so
+// it doesn't stay silent for a chime that will no longer play (or ding on top
+// of one that now will). Replacing `rest` also re-runs the keep-alive via the
+// deadline timer sync above.
+useAppPreferencesStore.subscribe((prefs, prevPrefs) => {
+  if (
+    prefs.restChimeThroughSilent === prevPrefs.restChimeThroughSilent &&
+    prefs.restTimerSoundEnabled === prevPrefs.restTimerSoundEnabled
+  ) {
+    return;
+  }
+  const state = useActiveWorkoutStore.getState();
+  const { rest } = state;
+  if (rest.state !== 'resting' || rest.endsAt == null) return;
+  const remainingMs = rest.endsAt - Date.now();
+  if (remainingMs <= 0) return;
+  cancelCurrentRestNotification(rest);
+  const token = ++restInstanceCounter;
+  useActiveWorkoutStore.setState({
+    rest: { ...rest, scheduledNotificationId: null, instanceToken: token },
+  });
+  scheduleActiveSetRestNotification(
+    state,
+    Math.max(1, Math.ceil(remainingMs / 1000)),
+    token
+  );
 });
 
 // JS timers pause while the app is backgrounded; re-sync on foreground return

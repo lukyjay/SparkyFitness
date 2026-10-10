@@ -1,6 +1,6 @@
 import React, { useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { View, ScrollView } from 'react-native';
+import { View, ScrollView, Platform } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -29,7 +29,9 @@ import type { RootStackScreenProps } from '../types/navigation';
 
 type WorkoutSettingsScreenProps = RootStackScreenProps<'WorkoutSettings'>;
 
-const WorkoutSettingsScreen: React.FC<WorkoutSettingsScreenProps> = () => {
+const WorkoutSettingsScreen: React.FC<WorkoutSettingsScreenProps> = ({
+  navigation,
+}) => {
   const { t } = useTranslation();
   const insets = useSafeAreaInsets();
   const queryClient = useQueryClient();
@@ -56,6 +58,12 @@ const WorkoutSettingsScreen: React.FC<WorkoutSettingsScreenProps> = () => {
   const setDefaultRestSec = useAppPreferencesStore((s) => s.setDefaultRestSec);
   const restTimerSoundEnabled = useAppPreferencesStore(
     (s) => s.restTimerSoundEnabled
+  );
+  const restChimeThroughSilent = useAppPreferencesStore(
+    (s) => s.restChimeThroughSilent
+  );
+  const setRestChimeThroughSilent = useAppPreferencesStore(
+    (s) => s.setRestChimeThroughSilent
   );
   const duckMusicDuringCues = useAppPreferencesStore(
     (s) => s.duckMusicDuringCues
@@ -143,6 +151,36 @@ const WorkoutSettingsScreen: React.FC<WorkoutSettingsScreenProps> = () => {
           }
         />
 
+        {restTimerSoundEnabled ? (
+          <SettingsRow
+            title={t('workoutSettings.restSoundSilent', {
+              defaultValue: 'Play through silent mode',
+            })}
+            subtitle={
+              Platform.OS === 'ios'
+                ? t('workoutSettings.restSoundSilentSubtitleIos', {
+                    defaultValue:
+                      'Play the rest chime even when your phone is on silent, including with the app in the background or the screen locked.',
+                  })
+                : t('workoutSettings.restSoundSilentSubtitle', {
+                    defaultValue:
+                      'Play the rest chime even when your phone is on silent or vibrate.',
+                  })
+            }
+            subtitleNumberOfLines={0}
+            rightAccessory={
+              <Switch
+                value={restChimeThroughSilent}
+                onValueChange={setRestChimeThroughSilent}
+                accessibilityLabel={t(
+                  'workoutSettings.restSoundSilentAccessibility',
+                  { defaultValue: 'Play rest timer sound through silent mode' }
+                )}
+              />
+            }
+          />
+        ) : null}
+
         <SettingsRow
           title={t('workoutSettings.duckMusic', {
             defaultValue: 'Lower music during cues',
@@ -181,6 +219,18 @@ const WorkoutSettingsScreen: React.FC<WorkoutSettingsScreenProps> = () => {
               })}
             />
           }
+        />
+
+        <SettingsRow
+          title={t('workoutSettings.warmupCalculator', {
+            defaultValue: 'Warm-up calculator',
+          })}
+          subtitle={t('workoutSettings.warmupCalculatorSubtitle', {
+            defaultValue:
+              'The ramp, and the weights it rounds to, for warm-up sets you add to an exercise.',
+          })}
+          subtitleNumberOfLines={0}
+          onPress={() => navigation.navigate('WarmupSettings')}
         />
 
         <SettingsRow

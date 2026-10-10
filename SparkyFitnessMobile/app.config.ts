@@ -34,6 +34,7 @@ const androidPermissions = [
   'android.permission.health.READ_BLOOD_PRESSURE',
   'android.permission.health.READ_BODY_FAT',
   'android.permission.health.READ_BODY_TEMPERATURE',
+  'android.permission.health.READ_BODY_WATER_MASS',
   'android.permission.health.READ_BONE_MASS',
   'android.permission.health.READ_CERVICAL_MUCUS',
   'android.permission.health.READ_CYCLING_PEDALING_CADENCE',
@@ -87,6 +88,7 @@ const devAndroidPermissions = [
   'android.permission.health.WRITE_BLOOD_PRESSURE',
   'android.permission.health.WRITE_BODY_FAT',
   'android.permission.health.WRITE_BODY_TEMPERATURE',
+  'android.permission.health.WRITE_BODY_WATER_MASS',
   'android.permission.health.WRITE_BONE_MASS',
   'android.permission.health.WRITE_CERVICAL_MUCUS',
   'android.permission.health.WRITE_CYCLING_PEDALING_CADENCE',
@@ -186,9 +188,20 @@ export default ({ config }: ConfigContext): Partial<ExpoConfig> => {
         // The localized InfoPlist permission strings come from `locales`; this
         // allows the generated app metadata to use the selected localization.
         CFBundleAllowMixedLocalizations: true,
+        // Lets the opt-in "Play through silent mode" rest chime (#2506) keep a
+        // silent track playing during a rest, so the chime still sounds with
+        // the app in the background. Nothing plays in the background unless
+        // that setting is on and a rest is running.
+        UIBackgroundModes: ['audio'],
+        // Lets the Siri and Shortcuts actions and the Lock Screen controls find
+        // the Keychain group the app shares with the widget extension.
+        // Read by the Siri and Shortcuts actions to find the widget snapshots.
+        APP_GROUP_IDENTIFIER: getIosAppGroup(),
+        SparkyKeychainGroup: `$(AppIdentifierPrefix)${getIosAppGroup()}`,
       },
       entitlements: {
         'com.apple.security.application-groups': [getIosAppGroup()],
+        'keychain-access-groups': [`$(AppIdentifierPrefix)${getIosAppGroup()}`],
         // Lets iOS honour the `timeSensitive` rest alert (see
         // `scheduleRestNotification`); without it a Focus mode silences it.
         'com.apple.developer.usernotifications.time-sensitive': true,
@@ -209,8 +222,10 @@ export default ({ config }: ConfigContext): Partial<ExpoConfig> => {
       ...(config.plugins ?? []),
       'expo-image',
       [
-        // Foreground playback only (rest-timer chime): no mic permission, no
-        // background-audio mode, no Android record/foreground-service perms.
+        // No mic permission and no Android record/foreground-service perms.
+        // iOS background audio for the rest chime comes from `UIBackgroundModes`
+        // above; the plugin flag would also add Android's media-playback
+        // foreground service, which the chime doesn't use.
         'expo-audio',
         {
           microphonePermission: false,
@@ -222,6 +237,7 @@ export default ({ config }: ConfigContext): Partial<ExpoConfig> => {
       './plugins/withAppLanguage',
       './plugins/withCalorieWidget',
       './plugins/withExactAlarmModule',
+      './plugins/withBackgroundWater',
       './plugins/withWorkoutNotification',
       './plugins/withEnrichedMarkdownNoMath',
       './plugins/withSceneLifecycle',

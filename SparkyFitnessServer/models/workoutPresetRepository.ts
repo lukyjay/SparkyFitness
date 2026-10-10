@@ -2,10 +2,38 @@ import { getClient } from '../db/poolManager.js';
 import { log } from '../config/logging.js';
 // @ts-expect-error TS(7016): Could not find a declaration file for module 'pg-format'
 import format from 'pg-format';
+import type { PoolClient } from 'pg';
+import { assertSetWeightSign } from '../utils/setWeightSign.js';
 import {
   buildSqlSearch,
   buildSqlExactMatchOrder,
 } from '../utils/dbSearchHelper.js';
+import { parseJsonArrayField } from '../utils/exerciseJsonFields.js';
+
+/** exercises.equipment is JSON text. Warm-up rounding needs a string array. */
+function parsePresetExerciseEquipment<
+  T extends { exercises?: { equipment?: unknown }[] },
+>(row: T | undefined): T | undefined {
+  if (!row?.exercises) return row;
+  for (const exercise of row.exercises) {
+    exercise.equipment = parseJsonArrayField(
+      typeof exercise.equipment === 'string' ? exercise.equipment : null
+    ).filter((item: unknown): item is string => typeof item === 'string');
+  }
+  return row;
+}
+
+async function assertPresetExerciseSetWeights(
+  client: PoolClient,
+  exerciseId: string,
+  sets: readonly { weight?: number | string | null }[] | null | undefined
+) {
+  const result = await client.query(
+    'SELECT modality FROM exercises WHERE id = $1',
+    [exerciseId]
+  );
+  assertSetWeightSign(sets, result.rows[0]?.modality ?? null);
+}
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function createWorkoutPreset(presetData: any) {
@@ -58,6 +86,11 @@ async function createWorkoutPreset(presetData: any) {
         );
         const newExerciseId = exerciseResult.rows[0].id;
         if (exercise.sets && exercise.sets.length > 0) {
+          await assertPresetExerciseSetWeights(
+            client,
+            exercise.exercise_id,
+            exercise.sets
+          );
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           const setsValues = exercise.sets.map((set: any) => [
             newExerciseId,
@@ -120,6 +153,7 @@ async function getWorkoutPresetByName(userId: any, name: any) {
                e.name as exercise_name,
                e.category as category,
                e.modality as modality,
+               e.equipment as equipment,
                COALESCE(
                  (SELECT json_agg(set_data ORDER BY set_data.set_number)
                   FROM (
@@ -148,7 +182,9 @@ async function getWorkoutPresetByName(userId: any, name: any) {
       LIMIT 1`,
       [userId, name]
     );
-    return result.rows[0] ? { ...result.rows[0], isNew: false } : null; // Add isNew: false for existing presets
+    return result.rows[0]
+      ? { ...parsePresetExerciseEquipment(result.rows[0]), isNew: false }
+      : null;
   } finally {
     client.release();
   }
@@ -186,6 +222,7 @@ async function getWorkoutPresets(userId: any, page = 1, limit = 10) {
                 e.name as exercise_name,
                 e.category as category,
                 e.modality as modality,
+                e.equipment as equipment,
                 COALESCE(
                   (SELECT json_agg(set_data ORDER BY set_data.set_number)
                    FROM (
@@ -210,7 +247,7 @@ async function getWorkoutPresets(userId: any, page = 1, limit = 10) {
       [limit, offset]
     );
     return {
-      presets: result.rows,
+      presets: result.rows.map((row: any) => parsePresetExerciseEquipment(row)),
       total,
       page,
       limit,
@@ -244,6 +281,7 @@ async function getWorkoutPresetById(presetId: any, userId: any) {
                 e.name as exercise_name,
                 e.category as category,
                 e.modality as modality,
+                e.equipment as equipment,
                 COALESCE(
                   (SELECT json_agg(set_data ORDER BY set_data.set_number)
                    FROM (
@@ -266,7 +304,7 @@ async function getWorkoutPresetById(presetId: any, userId: any) {
        GROUP BY wp.id`,
       [presetId]
     );
-    return result.rows[0];
+    return parsePresetExerciseEquipment(result.rows[0]);
   } finally {
     client.release();
   }
@@ -343,6 +381,11 @@ async function updateWorkoutPreset(
           );
           const newExerciseId = exerciseResult.rows[0].id;
           if (exercise.sets && exercise.sets.length > 0) {
+            await assertPresetExerciseSetWeights(
+              client,
+              exercise.exercise_id,
+              exercise.sets
+            );
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const setsValues = exercise.sets.map((set: any) => [
               newExerciseId,
@@ -483,6 +526,7 @@ async function addExerciseToWorkoutPreset(
     }
 
     if (sets && sets.length > 0) {
+      await assertPresetExerciseSetWeights(client, exerciseId, sets);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const setsValues = sets.map((set: any) => [
         exercisePresetId,
@@ -565,6 +609,7 @@ async function searchWorkoutPresets(
                e.name as exercise_name,
                e.category as category,
                e.modality as modality,
+               e.equipment as equipment,
                COALESCE(
                  (SELECT json_agg(set_data ORDER BY set_data.set_number)
                   FROM (
@@ -593,7 +638,7 @@ async function searchWorkoutPresets(
       selectQueryParams.push(limit);
     }
     const result = await client.query(query, selectQueryParams);
-    return result.rows;
+    return result.rows.map((row: any) => parsePresetExerciseEquipment(row));
   } finally {
     client.release();
   }

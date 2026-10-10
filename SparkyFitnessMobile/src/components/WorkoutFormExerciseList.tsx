@@ -33,13 +33,17 @@ import ExerciseSetRestSheet, {
   type ExerciseSetRestUpdate,
 } from './ExerciseSetRestSheet';
 import WorkoutReorderList from './WorkoutReorderList';
-import { distanceFromKm, weightFromKg } from '../utils/unitConversions';
+import { weightFromKg } from '../utils/unitConversions';
 import {
   draftExerciseToCardExercise,
   exerciseFromDraft,
   rendersCardioEffortForm,
+  resolveSnapshotModality,
+  setDistanceFromKm,
 } from '../utils/workoutSession';
 import { useAppPreferencesStore } from '../stores/appPreferencesStore';
+import { buildWarmupDrafts, hasLoggedWarmup } from '../utils/warmupDrafts';
+import { WARMUP_REST_SEC } from '@workspace/shared';
 import type { SetInputField, SetRowAccessoryHandle } from './SetRowChrome';
 import type {
   ActiveSetPatch,
@@ -129,6 +133,17 @@ interface WorkoutFormExerciseListProps {
    */
   onDuplicateExercise?: (clientId: string) => void;
   /**
+   * Enables the ⋮ "Add warm-ups" item: puts the lifter's warm-up ramp (their
+   * method and rounding, from Workout Settings → Warm-up calculator) ahead of
+   * the exercise's working sets. Shown only while the calculator is on and the
+   * first working set has a weight. Replaces unlogged warm-ups already there.
+   */
+  addWarmupSets?: (
+    clientId: string,
+    warmups: { weight: string; reps: string }[],
+    restSec: number
+  ) => void;
+  /**
    * Enables the ⋮ "Clear logged sets" item, shown only when the exercise has
    * a completed set and renders a set table — cardio-effort-form exercises
    * hide it (workout edit). Absent for forms whose drafts never carry
@@ -202,6 +217,7 @@ const WorkoutFormExerciseList = forwardRef<
     setExerciseNotes,
     onReplaceExercise,
     onDuplicateExercise,
+    addWarmupSets,
     clearExerciseCompletions,
     supersetWith,
     ungroupExercise,
@@ -313,6 +329,11 @@ const WorkoutFormExerciseList = forwardRef<
     (setId: string, patch: ActiveSetPatch) => {
       const owner = setOwnerByClientId.get(setId);
       if (!owner) return;
+      const ownerExercise = exercises.find((e) => e.clientId === owner);
+      const ownerModality = resolveSnapshotModality({
+        modality: ownerExercise?.exerciseModality,
+        category: ownerExercise?.exerciseCategory,
+      });
       if (patch.weight !== undefined) {
         const text =
           patch.weight == null
@@ -344,7 +365,11 @@ const WorkoutFormExerciseList = forwardRef<
             ? ''
             : String(
                 parseFloat(
-                  distanceFromKm(patch.distance, distanceUnit).toFixed(2)
+                  setDistanceFromKm(
+                    patch.distance,
+                    distanceUnit,
+                    ownerModality
+                  ).toFixed(2)
                 )
               );
         updateSetField(owner, setId, 'distance', text);
@@ -361,6 +386,7 @@ const WorkoutFormExerciseList = forwardRef<
     },
     [
       setOwnerByClientId,
+      exercises,
       updateSetField,
       updateSetMeta,
       weightUnit,
@@ -580,6 +606,31 @@ const WorkoutFormExerciseList = forwardRef<
     overflowSheetRef.current?.present();
   }, []);
 
+  const warmupCalculatorEnabled = useAppPreferencesStore(
+    (s) => s.warmupCalculatorEnabled
+  );
+  const warmupMethod = useAppPreferencesStore((s) => s.warmupMethod);
+  const warmupPlateRounding = useAppPreferencesStore(
+    (s) => s.warmupPlateRounding
+  );
+  const warmupDumbbellRounding = useAppPreferencesStore(
+    (s) => s.warmupDumbbellRounding
+  );
+  const warmupPreferences = useMemo(
+    () => ({
+      warmupCalculatorEnabled,
+      warmupMethod,
+      warmupPlateRounding,
+      warmupDumbbellRounding,
+    }),
+    [
+      warmupCalculatorEnabled,
+      warmupMethod,
+      warmupPlateRounding,
+      warmupDumbbellRounding,
+    ]
+  );
+
   const overflowMenuItems = useMemo<ActionSheetItem[]>(() => {
     if (overflowMenu == null) return [];
     const { clientId, mode } = overflowMenu;
@@ -642,6 +693,23 @@ const WorkoutFormExerciseList = forwardRef<
         onPress: () => onReplaceExercise(clientId),
       });
     }
+    if (addWarmupSets) {
+      const target = exercises.find((e) => e.clientId === clientId);
+      const card = cardExercises.find((c) => c.id === clientId);
+      const warmups =
+        card != null && target != null && !hasLoggedWarmup(target.sets)
+          ? buildWarmupDrafts(card, weightUnit, warmupPreferences)
+          : [];
+      if (warmups.length > 0) {
+        items.push({
+          key: 'warmups',
+          label: t('workout.addWarmups', {
+            defaultValue: 'Add warm-ups',
+          }),
+          onPress: () => addWarmupSets(clientId, warmups, WARMUP_REST_SEC),
+        });
+      }
+    }
     if (onDuplicateExercise) {
       items.push({
         key: 'duplicate',
@@ -693,6 +761,9 @@ const WorkoutFormExerciseList = forwardRef<
     ungroupExercise,
     onReplaceExercise,
     onDuplicateExercise,
+    addWarmupSets,
+    weightUnit,
+    warmupPreferences,
     clearExerciseCompletions,
     onRemoveExercise,
     onViewExercise,
