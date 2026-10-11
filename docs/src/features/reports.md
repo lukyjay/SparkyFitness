@@ -9,7 +9,7 @@ The Reports page is available from the top navigation bar when using SparkyFitne
 </p>
 
 ## Mobile app
-The Android and iOS apps display health trends for your steps, weight, and hydration. These trends appear at the bottom of the Dashboard screen for 7-, 30-, and 90-day periods.
+The Android and iOS apps display health trends for your steps, weight, sleep, and hydration. These trends appear at the bottom of the Dashboard screen for 7-, 30-, and 90-day periods.
 
 ## Web interface
 The below reports are available when using SparkyFitness in a web browser.
@@ -34,7 +34,7 @@ The below reports are available when using SparkyFitness in a web browser.
 
 The **Nutrients** page shows information over the selected range:
 
-- **Weekly alcohol summary:** the week ending on the end date of your range, handy for monitoring alcohol intake.
+- **Weekly alcohol summary:** your alcohol intake for the 7-day week containing your range's end date (aligned to your preferred first day of the week), handy for monitoring alcohol intake.
 - **Hydration trend:** your daily [Water Intake](/features/diary/water-intake) across the range, with the daily average.
 - **Period nutrition summary:** your totals for the whole range, compared against your [goals](/features/goals), including your overall cumulative balance. Select a measure from the drop-down box, or combine multiple.
 - **Nutrient charts:** a grid of charts tracking individual nutrients (protein, carbs, fat, and any custom nutrients you use) across the range. Hover over the charts to see how you performed against your goals for the day.
@@ -83,6 +83,8 @@ The **Fasting** tab turns your logged fasting sessions into a consistency report
 ### Exercise
 
 The **Exercise** tab analyzes your [exercise entries](/features/diary/exercise) over the range. The **view switcher** at the top lets you see **All Workouts**, just **Strength & Resistance**, or just **Cardio & GPS**, and the **Group by** selector aggregates data by day, week, month, or year.
+
+The **All Workouts** view brings everything together: the **Exercise Volume & Interval Totals** chart, snapshot charts (**Muscle Heat Map**, **Muscle Group Recovery**, **Exercise Variety Score**, and **Training Volume by Muscle Group**), and the same analysis charts as the Strength & Resistance view.
 
 **Strength & Resistance** charts include:
 
@@ -145,7 +147,7 @@ The **Medications** tab (*Medications Report* — "Analyze dose correlations, si
 
   The page is explicit that these correlations are "purely descriptive calculations over the chosen date range and do not imply clinical causality."
 
-- **Sharing with your prescriber:** use your browser's *Print* / *Save as PDF* action to turn the report into a PDF summary you can hand to your doctor.
+- **Sharing with your prescriber:** the **Prescriber-Ready Data Export** card offers a **Print / Save PDF Report** button that produces a clean PDF summary you can hand to your doctor, plus a **Download CSV Data** button for the raw numbers.
 
 
 - - -
